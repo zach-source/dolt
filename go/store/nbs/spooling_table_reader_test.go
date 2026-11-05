@@ -28,6 +28,7 @@ import (
 	"sync"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -322,6 +323,104 @@ func TestNBS_GitStore_OpenReadsOnlyIndexes(t *testing.T) {
 
 	require.NoError(t, reader.Close())
 	require.Zero(t, spools())
+}
+
+// A read holding an older table set can reach a table after the store has conjoined it away.
+// The table was never spooled, and its key is gone, but its chunks must still be readable.
+func TestNBS_GitStore_ReadsTableConjoinedAway(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found on PATH")
+	}
+	ctx := context.Background()
+	remote, err := gitrepo.InitBare(ctx, t.TempDir()+"/remote.git")
+	require.NoError(t, err)
+	open := func() *NomsBlockStore {
+		cache, err := gitrepo.InitBare(ctx, t.TempDir()+"/cache.git")
+		require.NoError(t, err)
+		out, err := exec.CommandContext(ctx, "git", "--git-dir", cache.GitDir, "remote", "add", "origin", remote.GitDir).CombinedOutput()
+		require.NoError(t, err, string(out))
+		st, err := NewGitStore(ctx, types.Format_DOLT.VersionString(), cache.GitDir, blobstore.DoltDataRef, blobstore.GitBlobstoreOptions{MaxPartSize: 8 * 1024, SpoolDir: t.TempDir()}, 0, NewUnlimitedMemQuotaProvider())
+		require.NoError(t, err)
+		return st
+	}
+	commit := func(st *NomsBlockStore, c chunks.Chunk) {
+		require.NoError(t, st.Put(ctx, c, noopGetAddrs))
+		last, err := st.Root(ctx)
+		require.NoError(t, err)
+		ok, err := st.Commit(ctx, c.Hash(), last)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+
+	// A writer pushes some tables, and a new store opens them without spooling.
+	writer := open()
+	defer writer.Close()
+	r := rand.New(rand.NewSource(1))
+	var written []chunks.Chunk
+	for i := 0; i < 3; i++ {
+		data := make([]byte, 16*1024)
+		_, err := r.Read(data)
+		require.NoError(t, err)
+		c := chunks.NewChunk(data)
+		commit(writer, c)
+		written = append(written, c)
+	}
+	st := open()
+	defer st.Close()
+	_, err = st.Root(ctx)
+	require.NoError(t, err)
+	require.Len(t, st.tables.upstream, 3)
+
+	// A read takes a reference to the table set, as the store's reads do. The conjoin cannot
+	// finish until the read releases it, but it removes the keys of the tables first.
+	old := st.tables
+	old.acquire()
+	release := sync.OnceFunc(old.release)
+	defer release()
+
+	data := make([]byte, 16*1024)
+	_, err = r.Read(data)
+	require.NoError(t, err)
+	st.conjoiner = inlineConjoiner{maxTables: 2}
+	commit(st, chunks.NewChunk(data))
+	bs := st.persister.(*singleBlobBSPersister).bs
+	require.Eventually(t, func() bool {
+		for _, source := range old.upstream {
+			exists, err := bs.Exists(ctx, source.hash().String())
+			if err != nil || exists {
+				return false
+			}
+		}
+		return true
+	}, time.Minute, 10*time.Millisecond, "conjoining must remove the keys of the old tables")
+
+	// The older table set can still read each chunk.
+	for _, c := range written[:2] {
+		got, gcb, err := old.get(ctx, c.Hash(), nil, st.stats)
+		require.NoError(t, err)
+		require.Equal(t, gcBehavior_Continue, gcb)
+		require.Equal(t, c.Data(), got)
+	}
+
+	// So can a sequential read of a table which has not been spooled.
+	var streamed int
+	for _, source := range old.upstream {
+		tr, ok := source.(*chunkSourceAdapter)
+		require.True(t, ok)
+		if tr.tableReader.r.(*spoolingTableReaderAt).f.Load() != nil {
+			continue
+		}
+		rc, _, err := source.reader(ctx, dherrors.FatalBehaviorError)
+		require.NoError(t, err)
+		_, err = io.Copy(io.Discard, rc)
+		require.NoError(t, err)
+		require.NoError(t, rc.Close())
+		streamed++
+	}
+	require.Equal(t, 1, streamed)
+
+	release()
+	waitForConjoin(st)
 }
 
 func TestNewSpoolingTableReaderAt_GetError(t *testing.T) {

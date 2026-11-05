@@ -429,7 +429,11 @@ func newBSTableChunkSource(ctx context.Context, bs blobstore.Blobstore, name has
 
 	var rdr tableReaderAt = &bsTableReaderAt{key: name.String(), bs: bs}
 	if shouldSpool(bs) {
-		rdr = newSpoolingTableReaderAt(bs, name.String(), int64(fileSz))
+		rdr, err = newPinnedSpoolingTableReaderAt(bs, name.String(), int64(fileSz))
+		if err != nil {
+			_ = index.Close()
+			return nil, err
+		}
 	}
 	tr, err := newTableReader(ctx, index, rdr, s3BlockSize)
 	if err != nil {

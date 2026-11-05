@@ -54,6 +54,8 @@ type spoolingTableReaderAt struct {
 	bs  blobstore.Blobstore
 	key string
 	sz  int64
+	// pinned reads the blob, if the blobstore can read it after |key| is removed.
+	pinned func(context.Context) (io.ReadCloser, error)
 	// f is the spool file, or nil if there is none yet.
 	f atomic.Pointer[os.File]
 	// spooling is a semaphore held while a file is written, so a blob is spooled only once.
@@ -67,6 +69,32 @@ func newSpoolingTableReaderAt(bs blobstore.Blobstore, key string, sz int64) *spo
 	s := &spoolingTableReaderAt{bs: bs, key: key, sz: sz, spooling: make(chan struct{}, 1)}
 	s.cnt.Store(1)
 	return s
+}
+
+// newPinnedSpoolingTableReaderAt is newSpoolingTableReaderAt for a table file being opened. With
+// nothing spooled yet, a read holding an older table set can reach this table after a conjoin
+// has removed |key|. The chunks are still needed, so the reader pins the blob as it is now.
+func newPinnedSpoolingTableReaderAt(bs blobstore.Blobstore, key string, sz int64) (*spoolingTableReaderAt, error) {
+	s := newSpoolingTableReaderAt(bs, key, sz)
+	if p, ok := bs.(interface {
+		PinBlob(key string) (func(context.Context) (io.ReadCloser, error), error)
+	}); ok {
+		pinned, err := p.PinBlob(key)
+		if err != nil {
+			return nil, err
+		}
+		s.pinned = pinned
+	}
+	return s, nil
+}
+
+// openBlob streams the whole blob.
+func (s *spoolingTableReaderAt) openBlob(ctx context.Context) (io.ReadCloser, error) {
+	if s.pinned != nil {
+		return s.pinned(ctx)
+	}
+	rc, _, _, err := s.bs.Get(ctx, s.key, blobstore.AllRange)
+	return rc, err
 }
 
 // newPersistedSpoolingTableReaderAt returns a reader of the blob |key| in |bs|, whose
@@ -119,7 +147,7 @@ func (s *spoolingTableReaderAt) spool(ctx context.Context) (*os.File, error) {
 		return f, nil
 	}
 
-	rc, _, _, err := s.bs.Get(ctx, s.key, blobstore.AllRange)
+	rc, err := s.openBlob(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -160,8 +188,7 @@ func (s *spoolingTableReaderAt) ReadAtWithStats(ctx context.Context, p []byte, o
 func (s *spoolingTableReaderAt) Reader(ctx context.Context) (io.ReadCloser, error) {
 	f := s.f.Load()
 	if f == nil {
-		rc, _, _, err := s.bs.Get(ctx, s.key, blobstore.AllRange)
-		return rc, err
+		return s.openBlob(ctx)
 	}
 	return &spoolFileReader{Reader: io.NewSectionReader(f, 0, s.sz), src: s.ref()}, nil
 }
@@ -269,6 +296,9 @@ func newSpooledBSArchiveChunkSource(ctx context.Context, bs blobstore.Blobstore,
 	if err != nil {
 		return nil, err
 	}
-	aRdr.reader = newSpoolingTableReaderAt(bs, key, int64(sz))
+	aRdr.reader, err = newPinnedSpoolingTableReaderAt(bs, key, int64(sz))
+	if err != nil {
+		return nil, errors.Join(err, aRdr.close())
+	}
 	return &archiveChunkSource{aRdr: aRdr, refs: noopRefCounter{}, blockSize: fileBlockSize}, nil
 }
