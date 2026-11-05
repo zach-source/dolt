@@ -20,9 +20,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	filelocks "github.com/dolthub/file-locks"
 	"github.com/stretchr/testify/require"
+
+	"github.com/dolthub/dolt/go/store/util/tempfiles"
 )
 
 // The locks belong to the open file rather than the process, so another Lock in this
@@ -262,41 +265,60 @@ func TestReleaseSpoolDir(t *testing.T) {
 	require.Equal(t, filelocks.ErrLocked, otherProcess(t, filepath.Dir(f.Name())).TryLock())
 }
 
-// A release that runs while a spool is being created must either see the spool or run before
-// the subdirectory is made again. It must never remove the subdirectory the spool goes in.
-func TestNewSpoolFile_RacingRelease(t *testing.T) {
+// blockingTempFileProvider holds NewFile until the test lets it go on.
+type blockingTempFileProvider struct {
+	tempfiles.TempFileProvider
+	entered chan struct{}
+	proceed chan struct{}
+}
+
+func (p blockingTempFileProvider) NewFile(dir, pattern string) (*os.File, error) {
+	close(p.entered)
+	<-p.proceed
+	return p.TempFileProvider.NewFile(dir, pattern)
+}
+
+// A release that runs while a spool is being created has to wait for it, and then see it.
+// If it did not wait, it would remove the subdirectory the spool is about to go in.
+func TestNewSpoolFile_ReleaseWaitsForSpoolBeingCreated(t *testing.T) {
 	dir := newTestSpoolDir(t)
+	f, err := newSpoolFile(dir)
+	require.NoError(t, err)
+	processDir := filepath.Dir(f.Name())
+	closeSpoolFile(t, f)
 
-	stop := make(chan struct{})
-	released := make(chan error, 1)
-	go func() {
-		for {
-			select {
-			case <-stop:
-				released <- nil
-				return
-			default:
-			}
-			if err := ReleaseSpoolDir(dir); err != nil {
-				released <- err
-				return
-			}
-		}
-	}()
-	defer func() {
-		close(stop)
-		require.NoError(t, <-released)
-	}()
+	provider := blockingTempFileProvider{tempfiles.MovableTempFileProvider, make(chan struct{}), make(chan struct{})}
+	tempfiles.MovableTempFileProvider = provider
+	t.Cleanup(func() { tempfiles.MovableTempFileProvider = provider.TempFileProvider })
 
-	for i := 0; i < 2000; i++ {
-		f, err := newSpoolFile(dir)
-		require.NoError(t, err, "iteration %d", i)
-		lock := otherProcess(t, filepath.Dir(f.Name()))
-		lockErr := lock.TryLock()
-		closeSpoolFile(t, f)
-		require.NoError(t, lock.Close())
-		require.Equal(t, filelocks.ErrLocked, lockErr, "iteration %d: a spool exists, so the lock must be held", i)
+	type result struct {
+		f   *os.File
+		err error
 	}
+	created := make(chan result, 1)
+	go func() {
+		f, err := newSpoolFile(dir)
+		created <- result{f, err}
+	}()
+	<-provider.entered
+
+	released := make(chan error, 1)
+	go func() { released <- ReleaseSpoolDir(dir) }()
+	select {
+	case <-released:
+		close(provider.proceed)
+		<-created
+		require.Fail(t, "a release ran while a spool was being created")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(provider.proceed)
+	res := <-created
+	require.NoError(t, res.err)
+	defer closeSpoolFile(t, res.f)
+	require.NoError(t, <-released)
+	require.Equal(t, processDir, filepath.Dir(res.f.Name()))
+	require.Equal(t, filelocks.ErrLocked, otherProcess(t, processDir).TryLock(), "the release must see the spool and keep the lock")
 }
 
 func TestSpoolTableReaderAt_UsesProcessDir(t *testing.T) {
