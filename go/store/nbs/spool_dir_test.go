@@ -234,6 +234,71 @@ func TestNewSpoolProcessDir_RacingClean(t *testing.T) {
 	}
 }
 
+func TestReleaseSpoolDir(t *testing.T) {
+	require.NoError(t, ReleaseSpoolDir(filepath.Join(t.TempDir(), "never-held")))
+
+	dir := newTestSpoolDir(t)
+	f, err := newSpoolFile(dir)
+	require.NoError(t, err)
+	processDir := filepath.Dir(f.Name())
+	other := otherProcess(t, processDir)
+
+	require.NoError(t, ReleaseSpoolDir(dir))
+	require.Equal(t, filelocks.ErrLocked, other.TryLock(), "a spool may still be in use, so the lock stays")
+
+	closeSpoolFile(t, f)
+	require.NoError(t, ReleaseSpoolDir(dir))
+	_, err = os.Stat(processDir)
+	require.True(t, os.IsNotExist(err), "a released subdirectory is removed")
+	_, err = os.Stat(spoolProcessLockPath(processDir))
+	require.True(t, os.IsNotExist(err), "a released lock file is removed")
+	require.NoError(t, ReleaseSpoolDir(dir), "releasing twice is harmless")
+
+	// The next spool makes a new subdirectory.
+	f, err = newSpoolFile(dir)
+	require.NoError(t, err)
+	defer closeSpoolFile(t, f)
+	require.NotEqual(t, processDir, filepath.Dir(f.Name()))
+	require.Equal(t, filelocks.ErrLocked, otherProcess(t, filepath.Dir(f.Name())).TryLock())
+}
+
+// A release that runs while a spool is being created must either see the spool or run before
+// the subdirectory is made again. It must never remove the subdirectory the spool goes in.
+func TestNewSpoolFile_RacingRelease(t *testing.T) {
+	dir := newTestSpoolDir(t)
+
+	stop := make(chan struct{})
+	released := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				released <- nil
+				return
+			default:
+			}
+			if err := ReleaseSpoolDir(dir); err != nil {
+				released <- err
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		require.NoError(t, <-released)
+	}()
+
+	for i := 0; i < 2000; i++ {
+		f, err := newSpoolFile(dir)
+		require.NoError(t, err, "iteration %d", i)
+		lock := otherProcess(t, filepath.Dir(f.Name()))
+		lockErr := lock.TryLock()
+		closeSpoolFile(t, f)
+		require.NoError(t, lock.Close())
+		require.Equal(t, filelocks.ErrLocked, lockErr, "iteration %d: a spool exists, so the lock must be held", i)
+	}
+}
+
 func TestSpoolTableReaderAt_UsesProcessDir(t *testing.T) {
 	dir := newTestSpoolDir(t)
 	ra, err := spoolTableReaderAt(dir, bytes.NewReader([]byte("table")))

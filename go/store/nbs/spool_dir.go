@@ -93,7 +93,9 @@ func spoolDirHoldFor(dir string) *spoolDirHold {
 	return h
 }
 
-// newSpoolFile makes an empty spool file in this process's subdirectory of |dir|.
+// newSpoolFile makes an empty spool file in this process's subdirectory of |dir|. The file is
+// made under h.mu so that ReleaseSpoolDir either sees it or runs before the subdirectory is
+// made again. So while this process does not hold a lock, it has no spools in |dir|.
 func newSpoolFile(dir string) (*os.File, error) {
 	h := spoolDirHoldFor(dir)
 	h.mu.Lock()
@@ -226,4 +228,34 @@ func removeSpoolProcess(processDir string) error {
 		return err
 	}
 	return os.Remove(spoolProcessLockPath(processDir))
+}
+
+// ReleaseSpoolDir gives up this process's lock on its subdirectory of |dir| and removes it,
+// for callers which have closed the stores spooling into it. If spools are still there, they
+// may still be in use, so the lock is kept until the process exits.
+func ReleaseSpoolDir(dir string) error {
+	spoolDirHoldsMu.Lock()
+	h, ok := spoolDirHolds[dir]
+	spoolDirHoldsMu.Unlock()
+	if !ok {
+		return nil
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.lock == nil {
+		return nil
+	}
+	entries, err := os.ReadDir(h.processDir)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if len(entries) > 0 {
+		return nil
+	}
+	err = removeSpoolProcess(h.processDir)
+	unlockSpoolDir(h.lock, h.processDir)
+	err = errors.Join(err, h.lock.Close())
+	h.processDir, h.lock = "", nil
+	return err
 }
