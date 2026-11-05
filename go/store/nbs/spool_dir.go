@@ -44,6 +44,8 @@ import (
 // makes it if it is not there, so one inside the subdirectory could reappear partway through
 // the removal and stop the subdirectory from being removed.
 //
+// The dolt binary calls CleanSpoolDir when it starts.
+//
 // Reads do not touch the lock. They use files which are already open, in a subdirectory
 // that cannot be cleaned while this process holds its lock.
 const (
