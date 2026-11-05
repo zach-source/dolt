@@ -68,7 +68,7 @@ func (f fakeGetBlobstore) SpoolDir() string { return testSpoolDir() }
 // countSpoolFiles counts leftover spool files in the fake blobstores' spool directory.
 func countSpoolFiles(t *testing.T) int {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(testSpoolDir(), "nbs-spool-*"))
+	matches, err := filepath.Glob(filepath.Join(testSpoolDir(), "*", "nbs-spool-*"))
 	require.NoError(t, err)
 	return len(matches)
 }
@@ -109,7 +109,7 @@ func TestSpoolingTableReaderAt_SpoolDir(t *testing.T) {
 
 	ra, err := newSpoolingTableReaderAt(ctx, bs, "table")
 	require.NoError(t, err)
-	require.Equal(t, dir, filepath.Dir(ra.f.Name()))
+	require.Equal(t, dir, filepath.Dir(filepath.Dir(ra.f.Name())))
 
 	require.NoError(t, ra.Close())
 	_, err = os.Stat(ra.f.Name())

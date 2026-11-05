@@ -26,7 +26,6 @@ import (
 	"github.com/dolthub/dolt/go/libraries/utils/file"
 	"github.com/dolthub/dolt/go/store/blobstore"
 	"github.com/dolthub/dolt/go/store/hash"
-	"github.com/dolthub/dolt/go/store/util/tempfiles"
 )
 
 var errNoSpoolDir = errors.New("cannot spool table file: blobstore has no spool directory")
@@ -71,10 +70,7 @@ func spoolTableReaderAt(dir string, r io.Reader) (*spoolingTableReaderAt, error)
 	if dir == "" {
 		return nil, errNoSpoolDir
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
-	f, err := tempfiles.MovableTempFileProvider.NewFile(dir, "nbs-spool-")
+	f, err := newSpoolFile(dir)
 	if err != nil {
 		return nil, err
 	}
