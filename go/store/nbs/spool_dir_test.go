@@ -321,13 +321,13 @@ func TestNewSpoolFile_ReleaseWaitsForSpoolBeingCreated(t *testing.T) {
 	require.Equal(t, filelocks.ErrLocked, otherProcess(t, processDir).TryLock(), "the release must see the spool and keep the lock")
 }
 
-func TestSpoolTableReaderAt_UsesProcessDir(t *testing.T) {
+func TestCreateSpoolFile_UsesProcessDir(t *testing.T) {
 	dir := newTestSpoolDir(t)
-	ra, err := spoolTableReaderAt(dir, bytes.NewReader([]byte("table")))
+	f, _, err := createSpoolFile(dir, bytes.NewReader([]byte("table")))
 	require.NoError(t, err)
-	require.Equal(t, filelocks.ErrLocked, otherProcess(t, filepath.Dir(ra.f.Name())).TryLock())
+	require.Equal(t, filelocks.ErrLocked, otherProcess(t, filepath.Dir(f.Name())).TryLock())
 
-	require.NoError(t, ra.Close())
-	_, err = os.Stat(ra.f.Name())
+	require.NoError(t, removeSpoolFile(f))
+	_, err = os.Stat(f.Name())
 	require.True(t, os.IsNotExist(err))
 }
